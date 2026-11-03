@@ -1,17 +1,9 @@
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
-import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import {
-	applyEditsToNormalizedContent,
-	detectLineEnding,
-	type Edit,
-	generateDiffString,
-	generateUnifiedPatch,
-	normalizeToLF,
-	restoreLineEndings,
-} from "./edit-diff.ts";
+import { applyMatchedEdits, type Edit, generateMatchedEditsDiff, matchEdits } from "./edit-diff.ts";
+import { type DecodedFile, decodeFile, describeNonUtf8Encoding, encodeNonUtf8File } from "./file-encoding.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { type EditRenderState, editRenderers } from "./renderers/edit.ts";
@@ -82,6 +74,11 @@ export interface EditOperations {
 	readFile: (absolutePath: string) => Promise<Buffer>;
 	/** Write content to a file */
 	writeFile: (absolutePath: string, content: string) => Promise<void>;
+	/**
+	 * Write raw bytes to a file. Used for files that are not UTF-8 (UTF-16 with BOM, or invalid UTF-8 such as
+	 * legacy encodings), which `writeFile` cannot reproduce. Without it, edits to such files are refused.
+	 */
+	writeFileBytes?: (absolutePath: string, content: Buffer) => Promise<void>;
 	/** Check if file is readable and writable (throw if not) */
 	access: (absolutePath: string) => Promise<void>;
 }
@@ -89,6 +86,7 @@ export interface EditOperations {
 const defaultEditOperations: EditOperations = {
 	readFile: (path) => fsReadFile(path),
 	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	writeFileBytes: (path, content) => fsWriteFile(path, content),
 	access: (path) => fsAccess(path, constants.R_OK | constants.W_OK),
 };
 
@@ -179,24 +177,20 @@ export function createEditToolDefinition(
 				}
 				throwIfAborted();
 
-				// Read the file.
-				const buffer = await ops.readFile(absolutePath);
-				const rawContent = buffer.toString("utf-8");
+				// Read the file. The decoded text has no BOM: the model will not include an invisible BOM in oldText.
+				const file = decodeFile(await ops.readFile(absolutePath));
+				throwIfAborted();
+				const writeText = getTextWriter(ops, absolutePath, path, file);
+
+				const match = matchEdits(file.text, edits, path, file.encoding);
+				const newText = applyMatchedEdits(match);
+				// Compute the diff before writing, so nothing can fail after the file has changed.
+				const { diff, patch, firstChangedLine } = generateMatchedEditsDiff(path, match);
 				throwIfAborted();
 
-				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-				const { bom, text: content } = splitBom(rawContent);
-				const originalEnding = detectLineEnding(content);
-				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				await writeText(newText);
 				throwIfAborted();
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-				await ops.writeFile(absolutePath, finalContent);
-				throwIfAborted();
-
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
 				return {
 					content: [
 						{
@@ -204,12 +198,36 @@ export function createEditToolDefinition(
 							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: { diff, patch, firstChangedLine },
 				};
 			});
 		},
 		...editRenderers,
 	};
+}
+
+/**
+ * Writer of edited text in the encoding, and with the BOM, the file was read with.
+ * Throws when the operations cannot write that encoding.
+ */
+function getTextWriter(
+	ops: EditOperations,
+	absolutePath: string,
+	path: string,
+	file: DecodedFile,
+): (text: string) => Promise<void> {
+	if (file.encoding === "utf-8") {
+		return (text) => ops.writeFile(absolutePath, (file.bom ? "\uFEFF" : "") + text);
+	}
+	const { writeFileBytes } = ops;
+	if (!writeFileBytes) {
+		throw new Error(
+			`Could not edit file: ${path}. The file is ${describeNonUtf8Encoding(file.encoding)}, and the configured edit operations can only write UTF-8 text. The file was left unchanged.`,
+		);
+	}
+	const { encoding } = file;
+	// Call as a method: custom operations may be class instances.
+	return (text) => writeFileBytes.call(ops, absolutePath, encodeNonUtf8File(encoding, text));
 }
 
 export function createEditTool(cwd: string, options?: EditToolOptions): TypeBoxAgentTool<typeof editSchema> {

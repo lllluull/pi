@@ -1,27 +1,15 @@
 /**
- * Shared diff computation utilities for the edit and similar tools.
+ * Shared matching, application and diff computation for the edit and similar tools.
  */
 
 import * as Diff from "diff";
 import { constants } from "fs";
 import { access, readFile } from "fs/promises";
-import { splitBom } from "../../utils/text.ts";
+import { decodeFile, type FileEncoding } from "./file-encoding.ts";
 import { resolveToCwd } from "./path-utils.ts";
-
-export function detectLineEnding(content: string): "\r\n" | "\n" {
-	const crlfIdx = content.indexOf("\r\n");
-	const lfIdx = content.indexOf("\n");
-	if (lfIdx === -1) return "\n";
-	if (crlfIdx === -1) return "\n";
-	return crlfIdx < lfIdx ? "\r\n" : "\n";
-}
 
 export function normalizeToLF(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-
-export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
-	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
 
 /**
@@ -63,14 +51,16 @@ interface LineSpan {
 	end: number;
 }
 
-interface MatchedEdit {
-	editIndex: number;
-	matchIndex: number;
-	matchLength: number;
+/** Replacement of the range [start, end) of some content with newText. */
+interface TextReplacement {
+	start: number;
+	end: number;
 	newText: string;
 }
 
-type TextReplacement = Pick<MatchedEdit, "matchIndex" | "matchLength" | "newText">;
+interface MatchedEdit extends TextReplacement {
+	editIndex: number;
+}
 
 function getLineSpans(content: string): LineSpan[] {
 	let offset = 0;
@@ -82,13 +72,10 @@ function getLineSpans(content: string): LineSpan[] {
 }
 
 function getReplacementLineRange(lines: LineSpan[], replacement: TextReplacement) {
-	const replacementStart = replacement.matchIndex;
-	const replacementEnd = replacement.matchIndex + replacement.matchLength;
-
 	let startLine = -1;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i];
-		if (replacementStart >= line.start && replacementStart < line.end) {
+		if (replacement.start >= line.start && replacement.start < line.end) {
 			startLine = i;
 			break;
 		}
@@ -98,7 +85,7 @@ function getReplacementLineRange(lines: LineSpan[], replacement: TextReplacement
 	}
 
 	let endLine = startLine;
-	while (endLine < lines.length && lines[endLine].end < replacementEnd) {
+	while (endLine < lines.length && lines[endLine].end < replacement.end) {
 		endLine++;
 	}
 	if (endLine >= lines.length) {
@@ -108,42 +95,42 @@ function getReplacementLineRange(lines: LineSpan[], replacement: TextReplacement
 	return { startLine, endLine: endLine + 1 };
 }
 
+/** Apply sorted, non-overlapping replacements whose offsets are relative to `content` shifted by `offset`. */
 function applyReplacements(content: string, replacements: TextReplacement[], offset = 0): string {
 	let result = content;
 	for (let i = replacements.length - 1; i >= 0; i--) {
 		const replacement = replacements[i];
-		const matchIndex = replacement.matchIndex - offset;
 		result =
-			result.substring(0, matchIndex) + replacement.newText + result.substring(matchIndex + replacement.matchLength);
+			result.substring(0, replacement.start - offset) +
+			replacement.newText +
+			result.substring(replacement.end - offset);
 	}
 	return result;
 }
 
 /**
- * Apply replacements matched against `baseContent` to `originalContent` while
- * preserving unchanged line blocks from the original.
+ * Turn replacements matched in `fuzzyContent` (a fuzzy-normalized view of
+ * `normalizedContent`) into replacements of `normalizedContent`.
  *
- * This is useful when `baseContent` is a normalized view of the original. Each
- * replacement is widened to the lines it actually touches, those touched lines
- * are rewritten from the normalized base, and all other lines are copied back
- * from `originalContent`. The actual replacement ranges drive preservation so
- * duplicate normalized lines cannot be aligned to the wrong occurrence.
+ * Each replacement is widened to the lines it actually touches, and those
+ * lines are rewritten from the fuzzy-normalized text. All other lines keep
+ * their original text. The actual replacement ranges drive this, so duplicate
+ * normalized lines cannot be aligned to the wrong occurrence.
  */
-export function applyReplacementsPreservingUnchangedLines(
-	originalContent: string,
-	baseContent: string,
+function widenFuzzyReplacementsToLines(
+	normalizedContent: string,
+	fuzzyContent: string,
 	replacements: TextReplacement[],
-): string {
-	const originalLines = splitLinesWithEndings(originalContent);
-	const baseLines = getLineSpans(baseContent);
-	if (originalLines.length !== baseLines.length) {
+): TextReplacement[] {
+	const normalizedLines = getLineSpans(normalizedContent);
+	const fuzzyLines = getLineSpans(fuzzyContent);
+	if (normalizedLines.length !== fuzzyLines.length) {
 		throw new Error("Cannot preserve unchanged lines because the base content has a different line count.");
 	}
 
 	const groups: Array<{ startLine: number; endLine: number; replacements: TextReplacement[] }> = [];
-	const sortedReplacements = [...replacements].sort((a, b) => a.matchIndex - b.matchIndex);
-	for (const replacement of sortedReplacements) {
-		const range = getReplacementLineRange(baseLines, replacement);
+	for (const replacement of replacements) {
+		const range = getReplacementLineRange(fuzzyLines, replacement);
 		const current = groups[groups.length - 1];
 		if (current && range.startLine < current.endLine) {
 			current.endLine = Math.max(current.endLine, range.endLine);
@@ -153,23 +140,15 @@ export function applyReplacementsPreservingUnchangedLines(
 		groups.push({ ...range, replacements: [replacement] });
 	}
 
-	let originalLineIndex = 0;
-	let result = "";
-	for (const group of groups) {
-		result += originalLines.slice(originalLineIndex, group.startLine).join("");
-
-		const groupStartOffset = baseLines[group.startLine].start;
-		const groupEndOffset = baseLines[group.endLine - 1].end;
-		result += applyReplacements(
-			baseContent.slice(groupStartOffset, groupEndOffset),
-			group.replacements,
-			groupStartOffset,
-		);
-		originalLineIndex = group.endLine;
-	}
-	result += originalLines.slice(originalLineIndex).join("");
-
-	return result;
+	return groups.map((group) => {
+		const fuzzyStart = fuzzyLines[group.startLine].start;
+		const fuzzyEnd = fuzzyLines[group.endLine - 1].end;
+		return {
+			start: normalizedLines[group.startLine].start,
+			end: normalizedLines[group.endLine - 1].end,
+			newText: applyReplacements(fuzzyContent.slice(fuzzyStart, fuzzyEnd), group.replacements, fuzzyStart),
+		};
+	});
 }
 
 export interface FuzzyMatchResult {
@@ -193,9 +172,28 @@ export interface Edit {
 	newText: string;
 }
 
-export interface AppliedEditsResult {
-	baseContent: string;
-	newContent: string;
+/** One replacement of matched edits, located both in the LF-normalized and in the original text. */
+export interface EditReplacement {
+	/** Start offset in the LF-normalized text */
+	start: number;
+	/** End offset (exclusive) in the LF-normalized text */
+	end: number;
+	/** Start offset of the same range in the original text */
+	originalStart: number;
+	/** End offset (exclusive) of the same range in the original text */
+	originalEnd: number;
+	/** Replacement text with LF line endings */
+	newText: string;
+}
+
+/** Edits matched against a file's text, ready to apply or diff. */
+export interface MatchedEdits {
+	/** The decoded file text without BOM, with its original line endings */
+	text: string;
+	/** `text` with every CRLF and lone CR turned into LF. Matching and diffs work on this view. */
+	normalized: string;
+	/** Sorted, non-overlapping replacements */
+	replacements: EditReplacement[];
 }
 
 /**
@@ -288,20 +286,47 @@ function getNoChangeError(path: string, totalEdits: number): Error {
 	return new Error(`No changes made to ${path}. The replacements produced identical content.`);
 }
 
+const NOT_UTF8_ALTERNATIVES =
+	"The file was left unchanged. To change non-ASCII text, use bash (for example iconv, or a script that reads and writes the file in its encoding), or, if converting the file to UTF-8 is acceptable, rewrite it with write.";
+
+function describeEdit(path: string, editIndex: number, totalEdits: number): string {
+	return totalEdits === 1 ? `the edit to ${path}` : `edits[${editIndex}] to ${path}`;
+}
+
+function getNonAsciiEditError(path: string, editIndex: number, totalEdits: number): Error {
+	return new Error(
+		`Cannot apply ${describeEdit(path, editIndex, totalEdits)}: the file is not valid UTF-8 (it may use a legacy encoding such as Windows-1252, GBK or Shift-JIS), so its encoding is unknown. Edits to such files are only applied when oldText and newText are ASCII, which keeps every other byte unchanged. Anchor the edit on ASCII-only text. ${NOT_UTF8_ALTERNATIVES}`,
+	);
+}
+
+function getInexactMatchError(path: string, editIndex: number, totalEdits: number): Error {
+	return new Error(
+		`Cannot apply ${describeEdit(path, editIndex, totalEdits)}: the oldText only matches after normalizing whitespace or Unicode punctuation, and the file is not valid UTF-8, so only exact matches are applied. The oldText must match exactly including all whitespace and newlines.`,
+	);
+}
+
+function getSplitCharacterError(path: string, editIndex: number, totalEdits: number): Error {
+	return new Error(
+		`Cannot apply ${describeEdit(path, editIndex, totalEdits)}: the file is not valid UTF-8, and the edit changes the byte right after a non-ASCII byte. In multi-byte encodings such as GBK or Shift-JIS that byte can belong to the preceding character. Keep the first character of oldText unchanged in newText. ${NOT_UTF8_ALTERNATIVES}`,
+	);
+}
+
+const NON_ASCII = /[\u0080-\uffff]/;
+
 /**
- * Apply one or more exact-text replacements to LF-normalized content.
+ * Match one or more exact-text replacements against a file's decoded text.
  *
- * All edits are matched against the same original content. Replacements are
- * then applied in reverse order so offsets remain stable. If any edit needs
- * fuzzy matching, the operation runs in fuzzy-normalized content space and then
- * overlays those line-level changes onto the original content so unchanged line
- * blocks keep their original bytes.
+ * Matching runs on an LF-normalized view of the text, and all edits are
+ * matched against the same original content. If any edit needs fuzzy
+ * matching, the replacements are widened to whole lines rewritten from the
+ * fuzzy-normalized text. The returned replacements also carry their offsets in
+ * the original text, so applying them leaves every other byte untouched.
+ *
+ * Text of the `bytes` encoding (not valid UTF-8) is decoded one character per
+ * byte. Its encoding is unknown, so only ASCII edits that match exactly are
+ * accepted: they splice exactly the bytes they replace.
  */
-export function applyEditsToNormalizedContent(
-	normalizedContent: string,
-	edits: Edit[],
-	path: string,
-): AppliedEditsResult {
+export function matchEdits(text: string, edits: Edit[], path: string, encoding: FileEncoding): MatchedEdits {
 	const normalizedEdits = edits.map((edit) => ({
 		oldText: normalizeToLF(edit.oldText),
 		newText: normalizeToLF(edit.newText),
@@ -311,10 +336,18 @@ export function applyEditsToNormalizedContent(
 		if (normalizedEdits[i].oldText.length === 0) {
 			throw getEmptyOldTextError(path, i, normalizedEdits.length);
 		}
+		if (encoding === "bytes" && NON_ASCII.test(normalizedEdits[i].oldText + normalizedEdits[i].newText)) {
+			throw getNonAsciiEditError(path, i, normalizedEdits.length);
+		}
 	}
 
+	const normalizedContent = normalizeToLF(text);
 	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
-	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
+	const fuzzyEditIndex = initialMatches.findIndex((match) => match.usedFuzzyMatch);
+	const usedFuzzyMatch = fuzzyEditIndex !== -1;
+	if (usedFuzzyMatch && encoding === "bytes") {
+		throw getInexactMatchError(path, fuzzyEditIndex, normalizedEdits.length);
+	}
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
 
 	const matchedEdits: MatchedEdit[] = [];
@@ -332,33 +365,112 @@ export function applyEditsToNormalizedContent(
 
 		matchedEdits.push({
 			editIndex: i,
-			matchIndex: matchResult.index,
-			matchLength: matchResult.matchLength,
+			start: matchResult.index,
+			end: matchResult.index + matchResult.matchLength,
 			newText: edit.newText,
 		});
 	}
 
-	matchedEdits.sort((a, b) => a.matchIndex - b.matchIndex);
+	matchedEdits.sort((a, b) => a.start - b.start);
 	for (let i = 1; i < matchedEdits.length; i++) {
 		const previous = matchedEdits[i - 1];
 		const current = matchedEdits[i];
-		if (previous.matchIndex + previous.matchLength > current.matchIndex) {
+		if (previous.end > current.start) {
 			throw new Error(
 				`edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in ${path}. Merge them into one edit or target disjoint regions.`,
 			);
 		}
 	}
 
-	const baseContent = normalizedContent;
-	const newContent = usedFuzzyMatch
-		? applyReplacementsPreservingUnchangedLines(normalizedContent, replacementBaseContent, matchedEdits)
-		: applyReplacements(replacementBaseContent, matchedEdits);
-
-	if (baseContent === newContent) {
+	const normalizedReplacements = usedFuzzyMatch
+		? widenFuzzyReplacementsToLines(normalizedContent, replacementBaseContent, matchedEdits)
+		: matchedEdits;
+	if (replacementsChangeNothing(normalizedContent, normalizedReplacements)) {
 		throw getNoChangeError(path, normalizedEdits.length);
 	}
 
-	return { baseContent, newContent };
+	const replacements = locateInOriginal(text, normalizedReplacements);
+	if (encoding === "bytes") {
+		for (const [i, replacement] of replacements.entries()) {
+			// Matching in `bytes` text is exact, so replacements[i] is matchedEdits[i].
+			const editIndex = matchedEdits[i].editIndex;
+			const previousByte = replacement.originalStart > 0 ? text.charCodeAt(replacement.originalStart - 1) : 0;
+			if (previousByte >= 0x80 && replacement.newText[0] !== normalizedContent[replacement.start]) {
+				throw getSplitCharacterError(path, editIndex, normalizedEdits.length);
+			}
+		}
+	}
+
+	return { text, normalized: normalizedContent, replacements };
+}
+
+/**
+ * Whether applying the replacements reproduces `content`. Compares in place
+ * instead of building the new content, which can be as large as the file.
+ */
+function replacementsChangeNothing(content: string, replacements: TextReplacement[]): boolean {
+	let position = replacements[0].start;
+	let previousEnd = position;
+	for (const replacement of replacements) {
+		if (!content.startsWith(content.slice(previousEnd, replacement.start), position)) return false;
+		position += replacement.start - previousEnd;
+		if (!content.startsWith(replacement.newText, position)) return false;
+		position += replacement.newText.length;
+		previousEnd = replacement.end;
+	}
+	return position === previousEnd;
+}
+
+/** Add the offsets of LF-normalized replacements in the original text. */
+function locateInOriginal(text: string, replacements: TextReplacement[]): EditReplacement[] {
+	// Only CRLF changes length when normalizing: the LF of the n-th CRLF (at original offset p)
+	// sits at p - n in the normalized text. A normalized offset maps to the original by adding
+	// the number of CRLFs before it, so a range covering that LF covers the whole CRLF.
+	let crlfBefore = 0;
+	let nextCrlf = text.indexOf("\r\n");
+	const toOriginal = (offset: number): number => {
+		while (nextCrlf !== -1 && nextCrlf - crlfBefore < offset) {
+			crlfBefore++;
+			nextCrlf = text.indexOf("\r\n", nextCrlf + 2);
+		}
+		return offset + crlfBefore;
+	};
+	return replacements.map((replacement) => {
+		const originalStart = toOriginal(replacement.start);
+		return { ...replacement, originalStart, originalEnd: toOriginal(replacement.end) };
+	});
+}
+
+/**
+ * Apply matched edits to the original text. Only the replaced ranges change.
+ * Line breaks in inserted text use the line ending of the line where the
+ * replaced range starts (see `lineEndingAt`).
+ */
+export function applyMatchedEdits(match: MatchedEdits): string {
+	const { text } = match;
+	const parts: string[] = [];
+	let position = 0;
+	for (const replacement of match.replacements) {
+		parts.push(text.slice(position, replacement.originalStart));
+		const ending = lineEndingAt(text, replacement.originalStart);
+		parts.push(ending === "\n" ? replacement.newText : replacement.newText.replaceAll("\n", ending));
+		position = replacement.originalEnd;
+	}
+	parts.push(text.slice(position));
+	return parts.join("");
+}
+
+/**
+ * Line ending of the line containing `offset`: its own LF or CRLF, or the one
+ * of the line before for an unterminated last line. A lone CR only counts in
+ * files without any LF (classic Mac line endings); elsewhere it is more likely
+ * a control character inside a line. Files without line endings use LF.
+ */
+function lineEndingAt(text: string, offset: number): "\r\n" | "\n" | "\r" {
+	let lineFeed = text.indexOf("\n", offset);
+	if (lineFeed === -1) lineFeed = text.lastIndexOf("\n", offset);
+	if (lineFeed === -1) return text.includes("\r") ? "\r" : "\n";
+	return text[lineFeed - 1] === "\r" ? "\r\n" : "\n";
 }
 
 /** Generate a standard unified patch. */
@@ -378,124 +490,81 @@ export function generateDiffString(
 	newContent: string,
 	contextLines = 4,
 ): { diff: string; firstChangedLine: number | undefined } {
-	const parts = Diff.diffLines(oldContent, newContent);
+	const { hunks } = Diff.structuredPatch("", "", oldContent, newContent, undefined, undefined, {
+		context: contextLines,
+	});
+	return formatDisplayDiff(hunks, {
+		oldLineCount: countLineFeeds(oldContent) + 1,
+		newLineCount: countLineFeeds(newContent) + 1,
+		oldContentLines: countContentLines(oldContent),
+	});
+}
+
+interface DisplayDiffLineCounts {
+	/** `content.split("\n").length` of the old content; with the new count it sets the line number width */
+	oldLineCount: number;
+	/** `content.split("\n").length` of the new content */
+	newLineCount: number;
+	/** Lines of the old content, not counting the empty string after a final LF */
+	oldContentLines: number;
+}
+
+/**
+ * Render unified-diff hunks as numbered lines: removed and context lines carry
+ * their old line number, added lines their new one, and "..." marks skipped
+ * unchanged lines before, between and after hunks.
+ */
+function formatDisplayDiff(
+	hunks: Diff.StructuredPatchHunk[],
+	counts: DisplayDiffLineCounts,
+): { diff: string; firstChangedLine: number | undefined } {
+	const lineNumWidth = String(Math.max(counts.oldLineCount, counts.newLineCount)).length;
+	const formatLineNum = (lineNum: number): string => String(lineNum).padStart(lineNumWidth, " ");
+	const skipped = ` ${"".padStart(lineNumWidth, " ")} ...`;
 	const output: string[] = [];
-
-	const oldLines = oldContent.split("\n");
-	const newLines = newContent.split("\n");
-	const maxLineNum = Math.max(oldLines.length, newLines.length);
-	const lineNumWidth = String(maxLineNum).length;
-
-	let oldLineNum = 1;
-	let newLineNum = 1;
-	let lastWasChange = false;
 	let firstChangedLine: number | undefined;
 
-	for (let i = 0; i < parts.length; i++) {
-		const part = parts[i];
-		const raw = part.value.split("\n");
-		if (raw[raw.length - 1] === "") {
-			raw.pop();
+	for (const [index, hunk] of hunks.entries()) {
+		if (index > 0 || hunk.oldStart > 1) {
+			output.push(skipped);
 		}
-
-		if (part.added || part.removed) {
-			// Capture the first changed line (in the new file)
-			if (firstChangedLine === undefined) {
-				firstChangedLine = newLineNum;
+		let oldLineNum = hunk.oldStart;
+		let newLineNum = hunk.newStart;
+		for (const line of hunk.lines) {
+			const text = line.slice(1);
+			// "\ No newline at end of file" markers have no counterpart in the display diff.
+			if (line[0] === "+") {
+				firstChangedLine ??= newLineNum;
+				output.push(`+${formatLineNum(newLineNum)} ${text}`);
+				newLineNum++;
+			} else if (line[0] === "-") {
+				firstChangedLine ??= newLineNum;
+				output.push(`-${formatLineNum(oldLineNum)} ${text}`);
+				oldLineNum++;
+			} else if (line[0] === " ") {
+				output.push(` ${formatLineNum(oldLineNum)} ${text}`);
+				oldLineNum++;
+				newLineNum++;
 			}
-
-			// Show the change
-			for (const line of raw) {
-				if (part.added) {
-					const lineNum = String(newLineNum).padStart(lineNumWidth, " ");
-					output.push(`+${lineNum} ${line}`);
-					newLineNum++;
-				} else {
-					// removed
-					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-					output.push(`-${lineNum} ${line}`);
-					oldLineNum++;
-				}
-			}
-			lastWasChange = true;
-		} else {
-			// Context lines - only show a few before/after changes
-			const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
-			const hasLeadingChange = lastWasChange;
-			const hasTrailingChange = nextPartIsChange;
-
-			if (hasLeadingChange && hasTrailingChange) {
-				if (raw.length <= contextLines * 2) {
-					for (const line of raw) {
-						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-						output.push(` ${lineNum} ${line}`);
-						oldLineNum++;
-						newLineNum++;
-					}
-				} else {
-					const leadingLines = raw.slice(0, contextLines);
-					const trailingLines = raw.slice(raw.length - contextLines);
-					const skippedLines = raw.length - leadingLines.length - trailingLines.length;
-
-					for (const line of leadingLines) {
-						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-						output.push(` ${lineNum} ${line}`);
-						oldLineNum++;
-						newLineNum++;
-					}
-
-					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-					oldLineNum += skippedLines;
-					newLineNum += skippedLines;
-
-					for (const line of trailingLines) {
-						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-						output.push(` ${lineNum} ${line}`);
-						oldLineNum++;
-						newLineNum++;
-					}
-				}
-			} else if (hasLeadingChange) {
-				const shownLines = raw.slice(0, contextLines);
-				const skippedLines = raw.length - shownLines.length;
-
-				for (const line of shownLines) {
-					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-					output.push(` ${lineNum} ${line}`);
-					oldLineNum++;
-					newLineNum++;
-				}
-
-				if (skippedLines > 0) {
-					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-					oldLineNum += skippedLines;
-					newLineNum += skippedLines;
-				}
-			} else if (hasTrailingChange) {
-				const skippedLines = Math.max(0, raw.length - contextLines);
-				if (skippedLines > 0) {
-					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-					oldLineNum += skippedLines;
-					newLineNum += skippedLines;
-				}
-
-				for (const line of raw.slice(skippedLines)) {
-					const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-					output.push(` ${lineNum} ${line}`);
-					oldLineNum++;
-					newLineNum++;
-				}
-			} else {
-				// Skip these context lines entirely
-				oldLineNum += raw.length;
-				newLineNum += raw.length;
-			}
-
-			lastWasChange = false;
+		}
+		if (index === hunks.length - 1 && oldLineNum - 1 < counts.oldContentLines) {
+			output.push(skipped);
 		}
 	}
 
 	return { diff: output.join("\n"), firstChangedLine };
+}
+
+function countLineFeeds(text: string): number {
+	let count = 0;
+	for (let index = text.indexOf("\n"); index !== -1; index = text.indexOf("\n", index + 1)) {
+		count++;
+	}
+	return count;
+}
+
+function countContentLines(text: string): number {
+	return countLineFeeds(text) + (text.length > 0 && !text.endsWith("\n") ? 1 : 0);
 }
 
 export interface EditDiffResult {
@@ -505,6 +574,130 @@ export interface EditDiffResult {
 
 export interface EditDiffError {
 	error: string;
+}
+
+export interface MatchedEditsDiff extends EditDiffResult {
+	/** Standard unified patch, as from `generateUnifiedPatch` */
+	patch: string;
+}
+
+const EDIT_DIFF_CONTEXT_LINES = 4;
+
+// Unchanged lines diffed around each change. More than the context: in runs of
+// repeated lines the diff may align a change further away, and the extra lines
+// let it align as the whole-file diff would. Diffing them costs little.
+const DIFF_WINDOW_MARGIN_LINES = 32;
+
+/**
+ * Display diff and unified patch of matched edits on the LF-normalized text,
+ * as `generateDiffString` and `generateUnifiedPatch` produce them for the
+ * whole file. Only windows around the changed lines are diffed; the rest of
+ * the file is only scanned for line numbers, so memory use does not grow with
+ * the file size. In long runs of repeated lines the whole-file diff could
+ * align a change differently; both are valid diffs of the same change.
+ */
+export function generateMatchedEditsDiff(path: string, match: MatchedEdits): MatchedEditsDiff {
+	const content = match.normalized;
+	const hunks: Diff.StructuredPatchHunk[] = [];
+	let lineDelta = 0;
+	for (const window of getDiffWindows(content, match.replacements, DIFF_WINDOW_MARGIN_LINES)) {
+		const oldText = content.slice(window.start, window.end);
+		const newText = applyReplacements(oldText, window.replacements, window.start);
+		const windowPatch = Diff.structuredPatch("", "", oldText, newText, undefined, undefined, {
+			context: EDIT_DIFF_CONTEXT_LINES,
+		});
+		for (const hunk of windowPatch.hunks) {
+			hunks.push({
+				...hunk,
+				oldStart: hunk.oldStart + window.firstLine,
+				newStart: hunk.newStart + window.firstLine + lineDelta,
+			});
+		}
+		// Every window but the last ends with an unchanged, LF-terminated line, so the change in
+		// line feeds is the shift of all later line numbers.
+		lineDelta += countLineFeeds(newText) - countLineFeeds(oldText);
+	}
+
+	const oldLineCount = countLineFeeds(content) + 1;
+	const { diff, firstChangedLine } = formatDisplayDiff(hunks, {
+		oldLineCount,
+		newLineCount: oldLineCount + lineDelta,
+		oldContentLines: countContentLines(content),
+	});
+	// formatPatch adjusts the start of empty hunks in place, so give it copies.
+	const patch = Diff.formatPatch(
+		{
+			oldFileName: path,
+			newFileName: path,
+			oldHeader: undefined,
+			newHeader: undefined,
+			hunks: hunks.map((hunk) => ({ ...hunk })),
+		},
+		Diff.FILE_HEADERS_ONLY,
+	);
+	return { diff, patch, firstChangedLine };
+}
+
+interface DiffWindow {
+	/** Zero-based number of the first line of the window */
+	firstLine: number;
+	/** Offsets of the window's whole lines in the content */
+	start: number;
+	end: number;
+	replacements: TextReplacement[];
+}
+
+/**
+ * Group replacements into windows of whole lines: the lines they touch plus
+ * `marginLines` unchanged lines on each side. Windows that would touch or
+ * overlap are merged. With a margin of at least the diff context, unchanged
+ * lines between windows are never shown as context of any hunk.
+ */
+function getDiffWindows(content: string, replacements: TextReplacement[], marginLines: number): DiffWindow[] {
+	// Zero-based line of an offset. Offsets are queried in ascending order, so one forward scan serves all.
+	let lineOfNext = 0;
+	let nextLineFeed = content.indexOf("\n");
+	const lineAt = (offset: number): number => {
+		while (nextLineFeed !== -1 && nextLineFeed < offset) {
+			lineOfNext++;
+			nextLineFeed = content.indexOf("\n", nextLineFeed + 1);
+		}
+		return lineOfNext;
+	};
+
+	const lineWindows: Array<{ firstLine: number; endLine: number; replacements: TextReplacement[] }> = [];
+	for (const replacement of replacements) {
+		const firstLine = Math.max(0, lineAt(replacement.start) - marginLines);
+		// The line containing the end offset counts as touched even when the range ends at its start:
+		// replacing the preceding line feed joins it to the line before.
+		const endLine = lineAt(replacement.end) + 1 + marginLines;
+		const current = lineWindows[lineWindows.length - 1];
+		if (current && firstLine <= current.endLine) {
+			current.endLine = endLine;
+			current.replacements.push(replacement);
+			continue;
+		}
+		lineWindows.push({ firstLine, endLine, replacements: [replacement] });
+	}
+
+	// Offset where a zero-based line starts, or the content length past the last line. Ascending queries again.
+	let scannedLine = 0;
+	let scannedOffset = 0;
+	const lineStart = (line: number): number => {
+		while (scannedLine < line && scannedOffset < content.length) {
+			const lineFeed = content.indexOf("\n", scannedOffset);
+			scannedOffset = lineFeed === -1 ? content.length : lineFeed + 1;
+			scannedLine++;
+		}
+		return scannedOffset;
+	};
+
+	return lineWindows.map((window) => ({
+		firstLine: window.firstLine,
+		start: lineStart(window.firstLine),
+		end: lineStart(window.endLine),
+		replacements: window.replacements,
+	}));
 }
 
 /**
@@ -527,16 +720,12 @@ export async function computeEditsDiff(
 			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
 		}
 
-		// Read the file
-		const rawContent = await readFile(absolutePath, "utf-8");
-
-		// Strip BOM before matching (LLM won't include invisible BOM in oldText)
-		const { text: content } = splitBom(rawContent);
-		const normalizedContent = normalizeToLF(content);
-		const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
-
-		// Generate the diff
-		return generateDiffString(baseContent, newContent);
+		const file = decodeFile(await readFile(absolutePath));
+		const { diff, firstChangedLine } = generateMatchedEditsDiff(
+			path,
+			matchEdits(file.text, edits, path, file.encoding),
+		);
+		return { diff, firstChangedLine };
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}

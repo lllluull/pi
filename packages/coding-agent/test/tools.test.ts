@@ -12,7 +12,13 @@ import {
 	createLocalBashOperations,
 } from "../src/core/tools/bash.ts";
 import { createEditToolDefinition } from "../src/core/tools/edit.ts";
-import { computeEditsDiff } from "../src/core/tools/edit-diff.ts";
+import {
+	computeEditsDiff,
+	generateDiffString,
+	generateMatchedEditsDiff,
+	generateUnifiedPatch,
+	matchEdits,
+} from "../src/core/tools/edit-diff.ts";
 import { createFindToolDefinition, type FindOperations } from "../src/core/tools/find.ts";
 import { createGrepToolDefinition } from "../src/core/tools/grep.ts";
 import { createLsToolDefinition } from "../src/core/tools/ls.ts";
@@ -1713,5 +1719,324 @@ describe("edit tool CRLF handling", () => {
 
 		const content = readFileSync(testFile, "utf-8");
 		expect(content).toBe("\uFEFFfirst\r\nSECOND\r\nthird\r\nFOURTH\r\n");
+	});
+
+	it("should write pure CRLF files with CRLF in inserted lines", async () => {
+		const testFile = join(testDir, "crlf-bytes.txt");
+		writeFileSync(testFile, "first\r\nsecond\r\nthird");
+
+		await editTool.execute("test-crlf-bytes", {
+			path: testFile,
+			edits: [{ oldText: "second\nthird", newText: "2a\r\n2b\nthird!" }],
+		});
+
+		expect(readFileSync(testFile).equals(Buffer.from("first\r\n2a\r\n2b\r\nthird!"))).toBe(true);
+	});
+
+	it("should keep the UTF-8 BOM bytes", async () => {
+		const testFile = join(testDir, "bom-bytes.txt");
+		writeFileSync(testFile, Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from("a\nb\n")]));
+
+		await editTool.execute("test-bom-bytes", { path: testFile, edits: [{ oldText: "b", newText: "B" }] });
+
+		expect(readFileSync(testFile).equals(Buffer.from([0xef, 0xbb, 0xbf, ...Buffer.from("a\nB\n")]))).toBe(true);
+	});
+
+	// #8544
+	it("should keep the line endings of untouched lines in mixed files", async () => {
+		const testFile = join(testDir, "mixed-untouched.txt");
+		writeFileSync(testFile, "a\nb\r\nX = 1\r\n");
+
+		const result = await editTool.execute("test-mixed-untouched", {
+			path: testFile,
+			edits: [{ oldText: "X = 1", newText: "X = 2" }],
+		});
+
+		expect(readFileSync(testFile).equals(Buffer.from("a\nb\r\nX = 2\r\n"))).toBe(true);
+		expect(result.details?.diff).toBe(" 1 a\n 2 b\n-3 X = 1\n+3 X = 2");
+	});
+
+	// #8544
+	it("should not rewrite LF lines when the first line ends with CRLF", async () => {
+		const testFile = join(testDir, "mixed-crlf-first.txt");
+		writeFileSync(testFile, "a\r\nb\nc");
+
+		await editTool.execute("test-mixed-crlf-first", { path: testFile, edits: [{ oldText: "c", newText: "C" }] });
+
+		expect(readFileSync(testFile).equals(Buffer.from("a\r\nb\nC"))).toBe(true);
+	});
+
+	// #8544
+	it("should give inserted lines the line ending of the line they replace", async () => {
+		const testFile = join(testDir, "mixed-insert.txt");
+		writeFileSync(testFile, "lf1\nlf2\ncr1\r\ncr2\r\n");
+
+		await editTool.execute("test-mixed-insert", {
+			path: testFile,
+			edits: [
+				{ oldText: "lf1\n", newText: "A\nB\n" },
+				{ oldText: "cr1\n", newText: "C\nD\n" },
+			],
+		});
+
+		expect(readFileSync(testFile).equals(Buffer.from("A\nB\nlf2\nC\r\nD\r\ncr2\r\n"))).toBe(true);
+	});
+
+	// #8544
+	it("should keep a lone CR in an untouched line", async () => {
+		const testFile = join(testDir, "lone-cr.txt");
+		writeFileSync(testFile, "a\rb\nX = 1\n");
+
+		await editTool.execute("test-lone-cr", { path: testFile, edits: [{ oldText: "X = 1", newText: "X = 2" }] });
+
+		expect(readFileSync(testFile).equals(Buffer.from("a\rb\nX = 2\n"))).toBe(true);
+	});
+
+	it("should use CR for inserted lines in files with only CR line endings", async () => {
+		const testFile = join(testDir, "cr-only.txt");
+		writeFileSync(testFile, "a\rb\rc\r");
+
+		await editTool.execute("test-cr-only", { path: testFile, edits: [{ oldText: "b\n", newText: "B1\nB2\n" }] });
+
+		expect(readFileSync(testFile).equals(Buffer.from("a\rB1\rB2\rc\r"))).toBe(true);
+	});
+
+	// #8544
+	it("should keep untouched line endings when fuzzy matching in mixed files", async () => {
+		const testFile = join(testDir, "mixed-fuzzy.txt");
+		writeFileSync(testFile, "a\r\nfoo   \r\nb\n");
+
+		await editTool.execute("test-mixed-fuzzy", { path: testFile, edits: [{ oldText: "foo\n", newText: "FOO\n" }] });
+
+		expect(readFileSync(testFile).equals(Buffer.from("a\r\nFOO\r\nb\n"))).toBe(true);
+	});
+});
+
+describe("edit tool encodings", () => {
+	let testDir: string;
+
+	beforeEach(() => {
+		testDir = join(tmpdir(), `coding-agent-encoding-test-${Date.now()}`);
+		mkdirSync(testDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(testDir, { recursive: true, force: true });
+	});
+
+	const latin1Content = Buffer.from("caf\xe9\nTIMEOUT = 30\n", "latin1");
+
+	// #10349, #5797
+	it("should apply ASCII edits to Latin-1 files without changing other bytes", async () => {
+		const testFile = join(testDir, "latin1.py");
+		writeFileSync(testFile, latin1Content);
+
+		const result = await editTool.execute("test-latin1", {
+			path: testFile,
+			edits: [{ oldText: "TIMEOUT = 30", newText: "TIMEOUT = 60" }],
+		});
+
+		expect(getTextOutput(result)).toContain("Successfully replaced");
+		expect(readFileSync(testFile).equals(Buffer.from("caf\xe9\nTIMEOUT = 60\n", "latin1"))).toBe(true);
+	});
+
+	// #10349
+	it("should apply ASCII edits to GBK files without changing other bytes", async () => {
+		const testFile = join(testDir, "gbk.py");
+		// "# 配置：超时时间（秒）\n" in GBK
+		const comment = Buffer.from("2320c5e4d6c3a3bab3accab1cab1bce4a3a8c3eba3a90a", "hex");
+		writeFileSync(testFile, Buffer.concat([comment, Buffer.from("TIMEOUT = 30\r\n")]));
+
+		await editTool.execute("test-gbk", {
+			path: testFile,
+			edits: [{ oldText: "TIMEOUT = 30\n", newText: "TIMEOUT = 60\nRETRIES = 3\n" }],
+		});
+
+		expect(
+			readFileSync(testFile).equals(Buffer.concat([comment, Buffer.from("TIMEOUT = 60\r\nRETRIES = 3\r\n")])),
+		).toBe(true);
+	});
+
+	// #10349
+	it("should refuse non-ASCII edits to files that are not valid UTF-8", async () => {
+		const testFile = join(testDir, "latin1-non-ascii.py");
+		writeFileSync(testFile, latin1Content);
+
+		await expect(
+			editTool.execute("test-latin1-non-ascii", {
+				path: testFile,
+				edits: [{ oldText: "TIMEOUT = 30", newText: "TIMEOUT = 30 # café" }],
+			}),
+		).rejects.toThrow(
+			/the file is not valid UTF-8 .*only applied when oldText and newText are ASCII.*left unchanged.*use bash/,
+		);
+		expect(readFileSync(testFile).equals(latin1Content)).toBe(true);
+	});
+
+	// #10349
+	it("should refuse fuzzy matches in files that are not valid UTF-8", async () => {
+		const testFile = join(testDir, "latin1-fuzzy.py");
+		const content = Buffer.from("caf\xe9 \nTIMEOUT = 30  \n", "latin1");
+		writeFileSync(testFile, content);
+
+		await expect(
+			editTool.execute("test-latin1-fuzzy", {
+				path: testFile,
+				edits: [{ oldText: "TIMEOUT = 30\n", newText: "TIMEOUT = 60\n" }],
+			}),
+		).rejects.toThrow(/only matches after normalizing whitespace.*only exact matches are applied/);
+		expect(readFileSync(testFile).equals(content)).toBe(true);
+	});
+
+	it("should refuse to change the byte after a non-ASCII byte in files that are not valid UTF-8", async () => {
+		const testFile = join(testDir, "shift-jis.txt");
+		// "表" in Shift-JIS is 95 5C; its second byte reads as a backslash.
+		const content = Buffer.concat([Buffer.from([0x95, 0x5c]), Buffer.from("abc\n")]);
+		writeFileSync(testFile, content);
+
+		await expect(
+			editTool.execute("test-sjis-split", { path: testFile, edits: [{ oldText: "\\abc", newText: "Xabc" }] }),
+		).rejects.toThrow(/changes the byte right after a non-ASCII byte/);
+		expect(readFileSync(testFile).equals(content)).toBe(true);
+
+		await editTool.execute("test-sjis-keep", { path: testFile, edits: [{ oldText: "\\abc", newText: "\\abd" }] });
+		expect(readFileSync(testFile).equals(Buffer.concat([Buffer.from([0x95, 0x5c]), Buffer.from("abd\n")]))).toBe(
+			true,
+		);
+	});
+
+	it("should refuse files that are not valid UTF-8 when operations cannot write bytes", async () => {
+		let written: string | undefined;
+		const textOnlyTool = createEditTool(testDir, {
+			operations: {
+				access: async () => {},
+				readFile: async () => latin1Content,
+				writeFile: async (_path, content) => {
+					written = content;
+				},
+			},
+		});
+
+		await expect(
+			textOnlyTool.execute("test-text-only-ops", {
+				path: "latin1.py",
+				edits: [{ oldText: "TIMEOUT = 30", newText: "TIMEOUT = 60" }],
+			}),
+		).rejects.toThrow(
+			"Could not edit file: latin1.py. The file is not valid UTF-8, and the configured edit operations can only write UTF-8 text. The file was left unchanged.",
+		);
+		expect(written).toBeUndefined();
+	});
+
+	it("should write bytes through custom operations that support it", async () => {
+		let written: Buffer | undefined;
+		const bytesTool = createEditTool(testDir, {
+			operations: {
+				access: async () => {},
+				readFile: async () => latin1Content,
+				writeFile: async () => {
+					throw new Error("writeFile must not be used for non-UTF-8 files");
+				},
+				writeFileBytes: async (_path, content) => {
+					written = content;
+				},
+			},
+		});
+
+		await bytesTool.execute("test-bytes-ops", {
+			path: "latin1.py",
+			edits: [{ oldText: "TIMEOUT = 30", newText: "TIMEOUT = 60" }],
+		});
+		expect(written?.equals(Buffer.from("caf\xe9\nTIMEOUT = 60\n", "latin1"))).toBe(true);
+	});
+
+	it("should edit UTF-16LE files with BOM and write them back as UTF-16LE", async () => {
+		const testFile = join(testDir, "utf16le.txt");
+		const encode = (text: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, "utf16le")]);
+		writeFileSync(testFile, encode("caf\u00e9\r\nX = 1\r\n"));
+
+		const result = await editTool.execute("test-utf16le", {
+			path: testFile,
+			edits: [{ oldText: "X = 1", newText: "X = \u00e9\u{1F600}" }],
+		});
+
+		expect(readFileSync(testFile).equals(encode("caf\u00e9\r\nX = \u00e9\u{1F600}\r\n"))).toBe(true);
+		expect(result.details?.diff).toContain("+2 X = \u00e9\u{1F600}");
+	});
+
+	it("should edit UTF-16BE files with BOM and write them back as UTF-16BE", async () => {
+		const testFile = join(testDir, "utf16be.txt");
+		const encode = (text: string) =>
+			Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text, "utf16le").swap16()]);
+		writeFileSync(testFile, encode("caf\u00e9\nX = 1\n"));
+
+		await editTool.execute("test-utf16be", { path: testFile, edits: [{ oldText: "X = 1", newText: "X = 2" }] });
+
+		expect(readFileSync(testFile).equals(encode("caf\u00e9\nX = 2\n"))).toBe(true);
+	});
+
+	it("should not match UTF-16 text decoded as UTF-8 with NUL bytes", async () => {
+		const testFile = join(testDir, "utf16le-nul.txt");
+		const content = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("X = 1\n", "utf16le")]);
+		writeFileSync(testFile, content);
+
+		await expect(
+			editTool.execute("test-utf16le-nul", {
+				path: testFile,
+				edits: [{ oldText: "X\u0000 \u0000=\u0000 \u00001", newText: "Y" }],
+			}),
+		).rejects.toThrow(/Could not find the exact text/);
+		expect(readFileSync(testFile).equals(content)).toBe(true);
+	});
+
+	it("should report encoding errors and UTF-16 diffs in the preview", async () => {
+		const latin1File = join(testDir, "preview-latin1.txt");
+		writeFileSync(latin1File, latin1Content);
+		const utf16File = join(testDir, "preview-utf16.txt");
+		writeFileSync(utf16File, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("X = 1\n", "utf16le")]));
+
+		const latin1Preview = await computeEditsDiff(latin1File, [{ oldText: "caf\u00e9", newText: "cafe" }], testDir);
+		const utf16Preview = await computeEditsDiff(utf16File, [{ oldText: "X = 1", newText: "X = 2" }], testDir);
+
+		expect(latin1Preview).toEqual({ error: expect.stringContaining("the file is not valid UTF-8") });
+		expect(utf16Preview).toEqual({ diff: "-1 X = 1\n+1 X = 2", firstChangedLine: 1 });
+	});
+});
+
+describe("edit tool diff of large files", () => {
+	const lines = Array.from({ length: 3000 }, (_, i) => `line ${i + 1}`);
+	const content = `${lines.join("\n")}\n`;
+
+	function expectSameAsWholeFileDiff(text: string, edits: Array<{ oldText: string; newText: string }>) {
+		const match = matchEdits(text, edits, "f.txt", "utf-8");
+		let newText = text;
+		for (const replacement of [...match.replacements].reverse()) {
+			newText = newText.slice(0, replacement.start) + replacement.newText + newText.slice(replacement.end);
+		}
+		const windowed = generateMatchedEditsDiff("f.txt", match);
+		const whole = generateDiffString(text, newText);
+		expect(windowed.diff).toBe(whole.diff);
+		expect(windowed.firstChangedLine).toBe(whole.firstChangedLine);
+		expect(windowed.patch).toBe(generateUnifiedPatch("f.txt", text, newText));
+	}
+
+	// The edit tool diffs only the changed lines plus context, so large files do not run out of memory.
+	it("should produce the same diff and patch as diffing the whole file", () => {
+		expectSameAsWholeFileDiff(content, [{ oldText: "line 1500\n", newText: "LINE 1500\nextra\n" }]);
+		expectSameAsWholeFileDiff(content, [{ oldText: "line 1\n", newText: "" }]);
+		expectSameAsWholeFileDiff(content, [{ oldText: "line 3000\n", newText: "end" }]);
+		expectSameAsWholeFileDiff(content.slice(0, -1), [{ oldText: "line 2999\nline 3000", newText: "tail" }]);
+		// Joins line 101 to line 103 by removing line 102 and its line feed.
+		expectSameAsWholeFileDiff(content, [{ oldText: "101\nline 102\n", newText: "101 " }]);
+	});
+
+	it("should merge or separate hunks of multiple edits as the whole-file diff does", () => {
+		for (const gap of [1, 7, 8, 9, 40, 80]) {
+			expectSameAsWholeFileDiff(content, [
+				{ oldText: "line 500\n", newText: "LINE 500\n" },
+				{ oldText: `line ${501 + gap}\n`, newText: `LINE ${501 + gap}\n` },
+				{ oldText: "line 2000\n", newText: "" },
+			]);
+		}
 	});
 });
