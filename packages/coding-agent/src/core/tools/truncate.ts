@@ -160,6 +160,136 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 }
 
 /**
+ * Streaming form of truncateHead: write the content in pieces of any size that do not split a
+ * surrogate pair, then end() returns exactly what truncateHead(content) returns. Only the lines that
+ * can be part of the output are kept, so memory stays bounded by maxBytes however large the content is.
+ */
+export class HeadTruncator {
+	readonly maxLines: number;
+	readonly maxBytes: number;
+	/** Bytes of the content's first line, final once end() returned. */
+	firstLineBytes = 0;
+	private totalBytes = 0;
+	private lineIndex = 0;
+	private lineHasText = false;
+	private lineBytes = 0;
+	private linePieces: string[] = [];
+	private readonly outputLines: string[] = [];
+	private outputBytes = 0;
+	private stoppedBy: "lines" | "bytes" | undefined;
+
+	constructor(options: TruncationOptions = {}) {
+		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+		this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+	}
+
+	/** Append the next piece of the content. */
+	write(text: string): void {
+		this.totalBytes += Buffer.byteLength(text, "utf-8");
+		let start = 0;
+		while (true) {
+			const newline = text.indexOf("\n", start);
+			const end = newline === -1 ? text.length : newline;
+			if (end > start) this.appendToLine(text, start, end);
+			if (newline === -1) return;
+			// A line followed by a newline is never the trailing empty line truncateHead drops.
+			this.takeLine();
+			this.lineIndex++;
+			this.lineHasText = false;
+			this.lineBytes = 0;
+			this.linePieces = [];
+			start = newline + 1;
+		}
+	}
+
+	/** The truncation result for all content written so far. */
+	end(): TruncationResult {
+		// An empty last line is the trailing newline's, which truncateHead does not count as a line.
+		if (this.lineHasText) this.takeLine();
+		const { maxLines, maxBytes } = this;
+		const totalBytes = this.totalBytes;
+		const totalLines = totalBytes === 0 ? 0 : this.lineIndex + (this.lineHasText ? 1 : 0);
+		if (totalLines <= maxLines && totalBytes <= maxBytes) {
+			// Every line fit, so all of them were kept.
+			const trailingNewline = this.lineIndex > 0 && !this.lineHasText ? "\n" : "";
+			return {
+				content: this.outputLines.join("\n") + trailingNewline,
+				truncated: false,
+				truncatedBy: null,
+				totalLines,
+				totalBytes,
+				outputLines: totalLines,
+				outputBytes: totalBytes,
+				lastLinePartial: false,
+				firstLineExceedsLimit: false,
+				maxLines,
+				maxBytes,
+			};
+		}
+		if (this.firstLineBytes > maxBytes) {
+			return {
+				content: "",
+				truncated: true,
+				truncatedBy: "bytes",
+				totalLines,
+				totalBytes,
+				outputLines: 0,
+				outputBytes: 0,
+				lastLinePartial: false,
+				firstLineExceedsLimit: true,
+				maxLines,
+				maxBytes,
+			};
+		}
+		return {
+			content: this.outputLines.join("\n"),
+			truncated: true,
+			truncatedBy: this.stoppedBy === "bytes" ? "bytes" : "lines",
+			totalLines,
+			totalBytes,
+			outputLines: this.outputLines.length,
+			outputBytes: this.outputBytes,
+			lastLinePartial: false,
+			firstLineExceedsLimit: false,
+			maxLines,
+			maxBytes,
+		};
+	}
+
+	private appendToLine(text: string, start: number, end: number): void {
+		this.lineHasText = true;
+		// The output stops at a line's end, after the first line's size is known: nothing else is needed.
+		if (this.stoppedBy !== undefined) return;
+		const piece = text.slice(start, end);
+		this.lineBytes += Buffer.byteLength(piece, "utf-8");
+		const separatorBytes = this.lineIndex > 0 ? 1 : 0;
+		if (this.outputBytes + separatorBytes + this.lineBytes <= this.maxBytes) {
+			this.linePieces.push(piece);
+		} else {
+			// The line cannot be output any more: keep counting its bytes, drop its text.
+			this.linePieces = [];
+		}
+	}
+
+	/** truncateHead's collection loop for one line. */
+	private takeLine(): void {
+		if (this.lineIndex === 0) this.firstLineBytes = this.lineBytes;
+		if (this.stoppedBy !== undefined) return;
+		if (this.lineIndex >= this.maxLines) {
+			this.stoppedBy = "lines";
+			return;
+		}
+		const lineBytes = this.lineBytes + (this.lineIndex > 0 ? 1 : 0);
+		if (this.outputBytes + lineBytes > this.maxBytes) {
+			this.stoppedBy = "bytes";
+			return;
+		}
+		this.outputLines.push(this.linePieces.join(""));
+		this.outputBytes += lineBytes;
+	}
+}
+
+/**
  * Truncate content from the tail (keep last N lines/bytes).
  * Suitable for bash output where you want to see the end (errors, final results).
  *
