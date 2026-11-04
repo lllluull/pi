@@ -95,20 +95,48 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Schema descriptions and property names, recursively. */
-function schemaText(schema: unknown, parts: string[]): void {
-	if (!isObject(schema)) return;
+/** Resolve a JSON Pointer within this schema resource, without fetching external schemas. */
+function localSchemaRef(root: unknown, ref: string): { schema: unknown; root: unknown } | undefined {
+	if (!ref.startsWith("#")) return;
+	let pointer: string;
+	try {
+		pointer = decodeURIComponent(ref.slice(1));
+	} catch {
+		return;
+	}
+	if (pointer !== "" && !pointer.startsWith("/")) return;
+	let schema = root;
+	for (const segment of pointer === "" ? [] : pointer.slice(1).split("/")) {
+		const key = segment.replace(/~1/g, "/").replace(/~0/g, "~");
+		if (typeof schema !== "object" || schema === null || !Object.hasOwn(schema, key)) return;
+		// JSON Pointers can also address an array element, such as an anyOf branch.
+		schema = (schema as Record<string, unknown>)[key];
+		if (isObject(schema) && typeof schema.$id === "string" && schema.$id !== "" && !schema.$id.startsWith("#"))
+			root = schema;
+	}
+	return { schema, root };
+}
+
+/** Schema descriptions and property names, including reachable local references. */
+function schemaText(schema: unknown, parts: string[], root: unknown = schema, seen = new Set<object>()): void {
+	if (!isObject(schema) || seen.has(schema)) return;
+	seen.add(schema);
+	if (typeof schema.$id === "string" && schema.$id !== "" && !schema.$id.startsWith("#")) root = schema;
 	if (typeof schema.description === "string") parts.push(schema.description);
+	if (typeof schema.$ref === "string") {
+		const target = localSchemaRef(root, schema.$ref);
+		if (target) schemaText(target.schema, parts, target.root, seen);
+	}
 	if (isObject(schema.properties)) {
 		for (const [name, property] of Object.entries(schema.properties)) {
 			parts.push(name);
-			schemaText(property, parts);
+			schemaText(property, parts, root, seen);
 		}
 	}
-	schemaText(schema.items, parts);
+	schemaText(schema.items, parts, root, seen);
 	for (const key of ["anyOf", "oneOf", "allOf"]) {
 		const variants = schema[key];
-		if (Array.isArray(variants)) for (const variant of variants) schemaText(variant, parts);
+		if (Array.isArray(variants)) for (const variant of variants) schemaText(variant, parts, root, seen);
 	}
 }
 

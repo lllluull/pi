@@ -61,6 +61,50 @@ function toolResultTexts(entries: readonly EntryRecord[]): string[] {
 }
 
 describe("deferred tools and tool_search", () => {
+	// https://github.com/earendil-works/pi/issues/11803
+	it("loads a tool by a referenced parameter description without indexing unused definitions", async () => {
+		const chat = setup();
+		addTool(
+			chat.registry,
+			tool("inspect", "Inspect records", {
+				deferred: true,
+				parameters: {
+					type: "object",
+					properties: { options: { $ref: "#/$defs/options" } },
+					$defs: {
+						options: {
+							type: "object",
+							properties: {
+								mode: { type: "string", description: "reconciliation" },
+								next: { $ref: "#/$defs/options" },
+							},
+						},
+						unused: { description: "astronomy" },
+					},
+				},
+			}),
+		);
+		chat.faux.setResponses([
+			call("tool_search", { query: "astronomy" }),
+			call("tool_search", { query: "reconciliation" }, "c2"),
+			call("inspect", { options: { mode: "balance" } }, "c3"),
+			DONE,
+		]);
+		const { harness, root } = await openChat(new MemoryStorage(), chat);
+		try {
+			expect(await offered(root)).not.toContain("inspect");
+			await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+			expect(toolResultTexts(await allEntries(root))).toEqual([
+				"No matching tools found.",
+				"Loaded 1 tool. They are available from your next call:\n- inspect: Inspect records",
+				"inspect ran",
+			]);
+			expect(await offered(root)).toContain("inspect");
+		} finally {
+			await harness.close(context);
+		}
+	});
+
 	it("offers a deferred tool only once tool_search loads it, by appending its declaration", async () => {
 		const chat = setup();
 		chat.faux.setResponses([

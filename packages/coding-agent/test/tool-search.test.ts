@@ -195,6 +195,79 @@ describe("Bm25Ranker", () => {
 	});
 });
 
+// https://github.com/earendil-works/pi/issues/11803
+describe("schema references in tool discovery", () => {
+	it.each(["$defs", "definitions"])("finds descriptions and property names through %s", (keyword) => {
+		const options = { type: "object", properties: { mode: { type: "string", description: "reconciliation" } } };
+		const referenced = tool("inspect", "Inspect records");
+		referenced.parameters = Type.Unsafe({
+			type: "object",
+			properties: { options: { $ref: `#/${keyword}/options` } },
+			[keyword]: { options, unused: { description: "astronomy" } },
+		});
+		const document = createToolSearchDocument(referenced);
+		expect(document).toEqual(createToolSearchDocument(tool("inspect", "Inspect records", { options })));
+		for (const query of ["mode", "reconciliation"]) {
+			expect(new Bm25Ranker().rank(query, [document], 8).map((match) => match.name)).toEqual(["inspect"]);
+		}
+		expect(new Bm25Ranker().rank("astronomy", [document], 8)).toEqual([]);
+	});
+
+	it("follows escaped pointer segments, array indices, and chained references", () => {
+		const referenced = tool("inspect", "Inspect records");
+		referenced.parameters = Type.Unsafe({
+			properties: { options: { $ref: "#/$defs/a~1b~0c%20d" } },
+			$defs: {
+				"a/b~c d": { $ref: "#/$defs/variants/anyOf/0" },
+				variants: { anyOf: [{ description: "reconciliation" }] },
+			},
+		});
+		expect(createToolSearchDocument(referenced).text).toBe("Inspect records options reconciliation");
+	});
+
+	it("visits recursive and shared definitions once while retaining reference siblings", () => {
+		const referenced = tool("inspect", "Inspect records");
+		referenced.parameters = Type.Unsafe({
+			properties: { first: { $ref: "#/$defs/node", description: "primary" }, second: { $ref: "#/$defs/node" } },
+			$defs: {
+				node: {
+					description: "reconciliation",
+					properties: { parent: { $ref: "#" }, next: { $ref: "#/$defs/node" } },
+				},
+			},
+		});
+		const document = createToolSearchDocument(referenced);
+		expect(document.text.match(/reconciliation/g)).toHaveLength(1);
+		expect(document.text).toContain("primary");
+		expect(document.text).toContain("next");
+	});
+
+	it("resolves pointers in a nested schema resource against its own root", () => {
+		const referenced = tool("inspect", "Inspect records");
+		referenced.parameters = Type.Unsafe({
+			properties: {
+				options: {
+					$id: "options.json",
+					properties: { mode: { $ref: "#/$defs/mode" } },
+					$defs: { mode: { description: "reconciliation" } },
+				},
+			},
+			$defs: { mode: { description: "astronomy" } },
+		});
+		expect(createToolSearchDocument(referenced).text).toBe("Inspect records options mode reconciliation");
+	});
+
+	it.each(["#/$defs/missing", "#/%ZZ", "https://example.com/schema.json#/$defs/node", "#/constructor"])(
+		"keeps other metadata searchable when it cannot follow %s",
+		(ref) => {
+			const referenced = tool("inspect", "Inspect records", {
+				options: { $ref: ref, description: "reconciliation" },
+			});
+			expect(createToolSearchDocument(referenced).text).toBe("Inspect records options reconciliation");
+		},
+	);
+});
+
 describe("codemode description catalog", () => {
 	const plain = tool("read_notes", "Read notes.");
 	const github = ["a", "b", "c"].map((suffix) => tool(`mcp__github__${suffix}`, `GitHub ${suffix}.`));
