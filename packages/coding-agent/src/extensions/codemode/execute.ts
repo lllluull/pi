@@ -705,7 +705,12 @@ function createDiscoveryGlobals(
 				const tool = tools.find(
 					(candidate) => candidate.name === name || toCodemodeIdentifier(candidate.name) === name,
 				);
-				return tool ? samples.get(tool.name) : undefined;
+				// Explicit inspection must recover input types omitted from the bounded catalog.
+				return tool
+					? renderToolSample(toCodemodeDeclaration(tool, options.getToolGuidelines?.().get(tool.name)), {
+							inputMaxChars: Number.POSITIVE_INFINITY,
+						})
+					: undefined;
 			},
 		},
 		{
